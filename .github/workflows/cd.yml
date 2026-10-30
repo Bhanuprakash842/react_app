@@ -61,6 +61,9 @@ jobs:
             type=sha,prefix=dev-,format=short,enable=${{ github.ref == 'refs/heads/dev' }}
             type=sha,prefix=main-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
         with:
