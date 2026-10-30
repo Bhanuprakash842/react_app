@@ -1,4 +1,33 @@
+import { useRef, useState, useEffect } from 'react';
 import './App.css';
+
+/* ── Scroll-reveal hook ── */
+function useReveal(options = {}) {
+  const ref = useRef(null);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          observer.unobserve(el);
+        }
+      },
+      { threshold: 0.15, ...options }
+    );
+
+    observer.observe(el);
+
+    return () => observer.disconnect();
+  }, [options]);
+
+  return [ref, visible];
+}
+
 
 const STEPS = [
   {
@@ -92,8 +121,13 @@ const FILES = [
 ];
 
 function Step({ step, index, total }) {
+  const [ref, visible] = useReveal();
   return (
-    <div className="step" style={{ '--color': step.color }}>
+    <div
+      ref={ref}
+      className={`step reveal ${visible ? 'revealed' : ''}`}
+      style={{ '--color': step.color, '--delay': `${index * 0.1}s` }}
+    >
       <div className="step-left">
         <div className="step-icon">{step.icon}</div>
         {index < total - 1 && <div className="step-line" />}
@@ -107,18 +141,33 @@ function Step({ step, index, total }) {
   );
 }
 
+function RevealBlock({ children, className = '', delay = 0 }) {
+  const [ref, visible] = useReveal();
+  return (
+    <div
+      ref={ref}
+      className={`reveal ${visible ? 'revealed' : ''} ${className}`}
+      style={{ '--delay': `${delay}s` }}
+    >
+      {children}
+    </div>
+  );
+}
+
 function App() {
   return (
     <div className="app">
 
       {/* Header */}
-      <header className="header">
-        <div className="header-badge">⚙️ DevOps Workflow</div>
-        <h1>How this project's<br /><span>CI/CD Pipeline</span> works</h1>
-        <p>
-          Every code change flows through an automated pipeline — from your local machine to a live Azure server — without any manual steps.
-        </p>
-      </header>
+      <RevealBlock>
+        <header className="header">
+          <div className="header-badge">⚙️ DevOps Workflow</div>
+          <h1>How this project's<br /><span>CI/CD Pipeline</span> works</h1>
+          <p>
+            Every code change flows through an automated pipeline — from your local machine to a live Azure server — without any manual steps.
+          </p>
+        </header>
+      </RevealBlock>
 
       {/* Workflow Steps */}
       <div className="section-label">The Pipeline — Step by Step</div>
@@ -129,34 +178,40 @@ function App() {
       </div>
 
       {/* Branch Triggers */}
-      <div className="triggers">
-        <div className="section-label">What Triggers What</div>
-        <div className="trigger-grid">
-          {TRIGGERS.map(t => (
-            <div className="trigger-card" key={t.branch} style={{ '--color': t.color }}>
-              <div className="trigger-branch">🌿 {t.branch}</div>
-              <ul className="trigger-steps">
-                {t.steps.map(s => <li key={s}>{s}</li>)}
-              </ul>
-            </div>
-          ))}
+      <RevealBlock delay={0.05}>
+        <div className="triggers">
+          <div className="section-label">What Triggers What</div>
+          <div className="trigger-grid">
+            {TRIGGERS.map((t, i) => (
+              <RevealBlock key={t.branch} delay={i * 0.1}>
+                <div className="trigger-card" style={{ '--color': t.color }}>
+                  <div className="trigger-branch">🌿 {t.branch}</div>
+                  <ul className="trigger-steps">
+                    {t.steps.map(s => <li key={s}>{s}</li>)}
+                  </ul>
+                </div>
+              </RevealBlock>
+            ))}
+          </div>
         </div>
-      </div>
+      </RevealBlock>
 
       {/* Files Added */}
-      <div className="file-tree-section">
-        <div className="section-label">Files Added to This Project</div>
-        <div className="file-tree">
-          {FILES.map((f, i) => (
-            <div key={i} style={{ paddingLeft: `${f.indent * 20}px` }}>
-              <span className={f.type === 'folder' ? 'folder' : f.type === 'new' ? 'file-new' : ''}>
-                {f.type === 'folder' ? '📁 ' : f.type === 'new' ? '✦ ' : '  '}{f.name}
-              </span>
-              {f.note && <span className="file-note">{f.note}</span>}
-            </div>
-          ))}
+      <RevealBlock delay={0.1}>
+        <div className="file-tree-section">
+          <div className="section-label">Files Added to This Project</div>
+          <div className="file-tree">
+            {FILES.map((f, i) => (
+              <div key={i} style={{ paddingLeft: `${f.indent * 20}px` }}>
+                <span className={f.type === 'folder' ? 'folder' : f.type === 'new' ? 'file-new' : ''}>
+                  {f.type === 'folder' ? '📁 ' : f.type === 'new' ? '✦ ' : '  '}{f.name}
+                </span>
+                {f.note && <span className="file-note">{f.note}</span>}
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      </RevealBlock>
 
       <footer className="footer">
         React · GitHub Actions · Docker Hub · Azure Linux VM
