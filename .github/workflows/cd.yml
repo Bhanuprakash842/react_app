@@ -106,8 +106,8 @@ jobs:
 
             docker pull "$IMAGE:$TAG"
 
-            docker stop reactapp-prod || true
-            docker rm reactapp-prod || true
+            docker stop reactapp-prod 
+            docker rm reactapp-prod 
 
             docker run -d \
               --name reactapp-prod \
