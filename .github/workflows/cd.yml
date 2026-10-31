@@ -79,53 +79,53 @@ jobs:
   # JOB 3: Deploy to Azure VM — MAIN BRANCH ONLY
   # -----------------------------------------------
   
-deploy:
-  name: 🚀 Deploy to Azure VM
-  runs-on: ubuntu-latest
-  needs: build-and-push
-  if: github.ref == 'refs/heads/main'
+  deploy:
+    name: 🚀 Deploy to Azure VM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
 
-  steps:
-    - name: Extract deployment image tag
-      id: deploy-meta
-      run: echo "tag=main-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+    steps:
+      - name: Extract deployment image tag
+        id: deploy-meta
+        run: echo "tag=main-${GITHUB_SHA::7}" >>  "$GITHUB_OUTPUT"
 
-    - name: SSH into Azure VM and deploy
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.AZURE_VM_IP }}
-        username: ${{ secrets.AZURE_VM_USER }}
-        key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+      - name: SSH into Azure VM and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_VM_IP }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
 
-        script: |
-          set -e
+          script: |
+            set -e
 
-          IMAGE="bhanuprakash842/reactapp"
-          TAG="${{ steps.deploy-meta.outputs.tag }}"
+            IMAGE="bhanuprakash842/reactapp"
+            TAG="${{ steps.deploy-meta.outputs.tag }}"
 
-          echo "================================"
-          echo "Starting production deployment"
-          echo "Image: $IMAGE:$TAG"
-          echo "================================"
+            echo "================================"
+            echo "Starting production deployment"
+            echo "Image: $IMAGE:$TAG"
+            echo "================================"
 
-          # Pull the exact production image
-          sudo docker pull "$IMAGE:$TAG"
+            # Pull the exact production image
+            sudo docker pull "$IMAGE:$TAG"
 
-          # Remove the previous production container
-          sudo docker rm -f reactapp-prod || true
+            # Remove the previous production container
+            sudo docker rm -f reactapp-prod || true
 
-          # Start the new production container
-          sudo docker run -d \
-            --name reactapp-prod \
-            --restart unless-stopped \
-            -p 80:80 \
-            "$IMAGE:$TAG"
+            # Start the new production container
+            sudo docker run -d \
+              --name reactapp-prod \
+              --restart unless-stopped \
+              -p 80:80 \
+              "$IMAGE:$TAG"
 
-          # Verify deployment
-          sudo docker ps --filter "name=reactapp-prod"
+            # Verify deployment
+            sudo docker ps --filter "name=reactapp-prod"
 
-          echo "Running image:"
-          sudo docker inspect reactapp-prod \
-            --format='{{.Config.Image}}'
+            echo "Running image:"
+            sudo docker inspect reactapp-prod \
+              --format='{{.Config.Image}}'
 
-          echo "Production deployment successful!"
+            echo "Production deployment successful!"
