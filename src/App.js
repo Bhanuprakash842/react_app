@@ -40,7 +40,7 @@ const STEPS = [
   {
     icon: '⚙️',
     color: '#06b6d4',
-    title: 'GitHub Actions Triggers - Github Actions',
+    title: 'GitHub Actions Triggers',
     desc: 'GitHub detects the push and automatically triggers the matching workflow file in .github/workflows/. No manual action needed — it runs on its own.',
     tag: '.github/workflows/',
   },
