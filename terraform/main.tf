@@ -150,4 +150,10 @@ resource "azurerm_linux_virtual_machine" "vm" {
   custom_data = base64encode(
     file("${path.module}/cloud-init.yaml")
   )
+
+  lifecycle {
+  ignore_changes = [
+    custom_data
+  ]
+}
 }
