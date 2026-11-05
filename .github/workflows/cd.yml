@@ -100,7 +100,7 @@ jobs:
           script: |
             set -e
 
-            IMAGE="bhanuprakash842/reactapp"
+            IMAGE="${{secrets.DOCKERHUB_USERNAME}}/reactapp"
             TAG="${{ steps.deploy-meta.outputs.tag }}"
 
             echo "================================"
