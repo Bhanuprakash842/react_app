@@ -3,6 +3,7 @@ name: React App - Terraform + Docker + Azure CD
 on:
   push:
     branches:
+      - dev
       - main
   workflow_dispatch:
 
@@ -10,6 +11,7 @@ permissions:
   contents: read
   id-token: write
 
+# Prevent simultaneous production deployments
 concurrency:
   group: reactapp-production
   cancel-in-progress: false
@@ -23,6 +25,7 @@ jobs:
 
   # ----------------------------------------
   # JOB 1: CI - TEST AND BUILD REACT APP
+  # Runs on dev and main
   # ----------------------------------------
   ci:
     name: CI - Test React Application
@@ -51,13 +54,16 @@ jobs:
         env:
           CI: true
 
+
   # ----------------------------------------
-  # JOB 2: TERRAFORM - PROVISION INFRASTRUCTURE
+  # JOB 2: TERRAFORM - PROVISION AZURE
+  # Runs only on main
   # ----------------------------------------
   provision:
     name: Terraform - Provision Azure Infrastructure
     runs-on: ubuntu-latest
     needs: ci
+    if: github.ref == 'refs/heads/main'
 
     defaults:
       run:
@@ -66,14 +72,14 @@ jobs:
     env:
       TF_IN_AUTOMATION: true
 
-      # Terraform Azure authentication using GitHub OIDC
+      # Azure OIDC authentication
       ARM_USE_OIDC: true
       ARM_USE_AZUREAD: true
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Terraform input variables
+      # Terraform variables
       TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       TF_VAR_location: koreacentral
       TF_VAR_vm_size: Standard_D2s_v3
@@ -112,8 +118,10 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
 
+
   # ----------------------------------------
   # JOB 3: BUILD AND PUSH DOCKER IMAGE
+  # Runs on dev and main
   # ----------------------------------------
   docker:
     name: Docker - Build and Push Image
@@ -127,12 +135,23 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Generate Docker image tag
+      - name: Generate Docker image tags
         id: meta
+        shell: bash
         run: |
-          TAG="main-${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF}" == "refs/heads/dev" ]]; then
+            TAG="dev-${GITHUB_SHA::7}"
+            LATEST_TAG="dev-latest"
+          else
+            TAG="main-${GITHUB_SHA::7}"
+            LATEST_TAG="latest"
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
           echo "Docker image tag: $TAG"
+          echo "Latest tag: $LATEST_TAG"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -143,19 +162,21 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
+      - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ steps.meta.outputs.tag }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ steps.meta.outputs.latest_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
   # ----------------------------------------
   # JOB 4: DEPLOY TO AZURE VM
+  # Runs only on main
   # ----------------------------------------
   deploy:
     name: Deploy React App to Azure VM
@@ -164,6 +185,8 @@ jobs:
     needs:
       - provision
       - docker
+
+    if: github.ref == 'refs/heads/main'
 
     steps:
       - name: Login to Azure using OIDC
@@ -174,16 +197,23 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prepare deployment image
+        env:
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
         run: |
-          echo "Deploying image:"
-          echo "${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ needs.docker.outputs.image_tag }}"
+          echo "Deploying production image:"
+          echo "${{ secrets.DOCKERHUB_USERNAME }}/reactapp:$IMAGE_TAG"
 
       - name: Deploy Docker container using Azure Run Command
         env:
           IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ needs.docker.outputs.image_tag }}
+        shell: bash
         run: |
           set -euo pipefail
 
+          echo "Starting production deployment..."
+          echo "Image: $IMAGE"
+
+          # Prepare script to execute inside Azure VM
           REMOTE_SCRIPT=$(cat <<EOF
           set -e
 
@@ -198,7 +228,7 @@ jobs:
             apt-get install -y curl
           fi
 
-          echo "Pulling image: $IMAGE"
+          echo "Pulling Docker image..."
           docker pull "$IMAGE"
 
           echo "Removing old production container..."
@@ -217,8 +247,10 @@ jobs:
             if curl -fsS http://127.0.0.1/ >/dev/null; then
               echo "Application is healthy!"
               docker ps --filter name=reactapp-prod
+
               docker inspect reactapp-prod \
                 --format='Running image: {{.Config.Image}}'
+
               exit 0
             fi
 
@@ -231,6 +263,7 @@ jobs:
           EOF
           )
 
+          # Execute deployment script on Azure VM
           az vm run-command invoke \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$AZURE_VM_NAME" \
