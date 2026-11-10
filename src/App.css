@@ -243,6 +243,20 @@ code {
   color: #484f58;
 }
 
+/* ── Scroll-Reveal Animations ── */
+.reveal {
+  opacity: 0;
+  transform: translateY(32px);
+  transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1) var(--delay, 0s),
+              transform 0.6s cubic-bezier(0.16, 1, 0.3, 1) var(--delay, 0s);
+  will-change: opacity, transform;
+}
+
+.reveal.revealed {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 @media (max-width: 600px) {
   .header h1 { font-size: 1.6rem; }
   .trigger-grid { grid-template-columns: 1fr; }
