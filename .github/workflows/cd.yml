@@ -158,9 +158,29 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Guard: check the VM exists before attempting deployment.
+      # On the very first push, terraform.yml may not have run yet
+      # (or may have run in parallel). Skip gracefully so the pipeline
+      # doesn't crash — the next push after Terraform succeeds will deploy.
+      - name: Check VM Exists
+        id: vm_check
+        run: |
+          if az vm show \
+              --resource-group reactapp-infra-rg \
+              --name reactapp-vm &>/dev/null; then
+            echo "vm_exists=true" >> "$GITHUB_OUTPUT"
+            echo "✓ VM exists — proceeding with deployment."
+          else
+            echo "vm_exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::VM 'reactapp-vm' not found in 'reactapp-infra-rg'."
+            echo "The Infrastructure pipeline (terraform.yml) must run and"
+            echo "succeed before the first deployment. Skipping deploy."
+          fi
+
       # Uses Azure VM Run Command — no SSH private key needed.
       # The script runs directly on the VM through the Azure control plane.
       - name: Deploy Docker Container
+        if: steps.vm_check.outputs.vm_exists == 'true'
         run: |
           echo "========== DEPLOYMENT STARTED =========="
           echo "Docker Image: $IMAGE"
@@ -212,6 +232,7 @@ jobs:
             "
 
       - name: Show Deployment Details
+        if: steps.vm_check.outputs.vm_exists == 'true'
         run: |
           PUBLIC_IP=$(az vm show \
             --resource-group reactapp-infra-rg \
