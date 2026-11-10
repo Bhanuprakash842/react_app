@@ -89,7 +89,12 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=reactapp-prod.tfstate" \
+            -backend-config="use_azuread_auth=true"
 
       - name: Terraform Validate
         working-directory: terraform
