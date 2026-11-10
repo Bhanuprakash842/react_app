@@ -160,30 +160,7 @@ jobs:
             echo "✓ Blob container exists: $CONTAINER"
           fi
 
-          ACCOUNT_ID=$(az storage account show \
-            --name "$STORAGE_ACCOUNT" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query id --output tsv)
-
-          SP_OBJECT_ID=$(az ad sp show \
-            --id "${{ secrets.AZURE_CLIENT_ID }}" \
-            --query id --output tsv)
-
-          ROLE_EXISTS=$(az role assignment list \
-            --assignee "$SP_OBJECT_ID" \
-            --role "Storage Blob Data Contributor" \
-            --scope "$ACCOUNT_ID" \
-            --query "length(@)")
-
-          if [ "$ROLE_EXISTS" -eq "0" ]; then
-            echo "Assigning Storage Blob Data Contributor to service principal"
-            az role assignment create \
-              --assignee "$SP_OBJECT_ID" \
-              --role "Storage Blob Data Contributor" \
-              --scope "$ACCOUNT_ID"
-          else
-            echo "✓ RBAC already assigned"
-          fi
+          echo "✓ Backend storage account and container are verified."
 
           echo "===== Backend is ready ====="
 
