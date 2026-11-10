@@ -2,13 +2,11 @@
 variable "subscription_id" {
   description = "Azure subscription ID"
   type        = string
-  default     = "144f3813-1346-45a5-ba59-f8dc12a29b90"
 }
 
 variable "tenant_id" {
   description = "Microsoft Entra tenant ID"
   type        = string
-  default     = "b57b6424-4f9c-444e-9110-b840e381d80a"
 }
 
 variable "github_repository" {

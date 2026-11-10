@@ -7,17 +7,9 @@ terraform {
       version = "~> 4.0"
     }
   }
-  backend "azurerm" {
-    storage_account_name = "reactapptfstate6ru524"
-    container_name       = "tfstate"
-    key                  = "reactapp-prod.tfstate"
-
-    tenant_id       = "b57b6424-4f9c-444e-9110-b840e381d80a"
-    subscription_id = "144f3813-1346-45a5-ba59-f8dc12a29b90"
-    client_id       = "dfdb020b-8fc2-4582-aaf3-032015085c3e"
-
-    use_azuread_auth = true
-  }
+  # Backend config is loaded from terraform/backend.hcl (gitignored).
+  # Run: terraform init -backend-config=backend.hcl
+  backend "azurerm" {}
 }
 
 # Azure Provider
