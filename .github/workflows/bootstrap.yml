@@ -89,16 +89,30 @@ jobs:
                 --name "$STORAGE_ACCOUNT" \
                 --resource-group "$RESOURCE_GROUP" &>/dev/null; then
             echo "Creating storage account: $STORAGE_ACCOUNT"
-            az storage account create \
-              --name "$STORAGE_ACCOUNT" \
-              --resource-group "$RESOURCE_GROUP" \
-              --location "$LOCATION" \
-              --sku Standard_LRS \
-              --kind StorageV2 \
-              --min-tls-version TLS1_2 \
-              --https-only true \
-              --allow-blob-public-access false \
-              --default-action Allow
+
+            SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+            az rest \
+              --method PUT \
+              --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}?api-version=2024-01-01" \
+              --body "{
+                \"sku\":     { \"name\": \"Standard_LRS\" },
+                \"kind\":     \"StorageV2\",
+                \"location\": \"${LOCATION}\",
+                \"properties\": {
+                  \"minimumTlsVersion\":       \"TLS1_2\",
+                  \"supportsHttpsTrafficOnly\": true,
+                  \"allowBlobPublicAccess\":    false
+                }
+              }"
+
+            echo "Waiting for storage account to provision..."
+            until az storage account show \
+                    --name "$STORAGE_ACCOUNT" \
+                    --resource-group "$RESOURCE_GROUP" \
+                    --query "provisioningState" --output tsv 2>/dev/null | grep -q "Succeeded"; do
+              echo "  Still provisioning..."
+              sleep 5
+            done
             echo "Storage account created."
           else
             echo "Storage account '$STORAGE_ACCOUNT' already exists. Skipping."
@@ -131,10 +145,11 @@ jobs:
       - name: Enable Blob Versioning on Storage Account
         run: |
           echo "===== STEP 4: Blob Versioning ====="
-          az storage account blob-service-properties update \
-            --account-name "$STORAGE_ACCOUNT" \
-            --resource-group "$RESOURCE_GROUP" \
-            --enable-versioning true
+          SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+          az rest \
+            --method PUT \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}/blobServices/default?api-version=2024-01-01" \
+            --body '{"properties": {"isVersioningEnabled": true}}'
           echo "Blob versioning enabled."
 
       # ----------------------------------------------------------
