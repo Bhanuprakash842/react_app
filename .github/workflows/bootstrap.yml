@@ -1,0 +1,305 @@
+name: Pipeline 1 - Bootstrap (Foundation Infrastructure)
+
+# ============================================================
+# PURPOSE: Provision ALL foundational Azure resources:
+#   - Terraform remote state backend (storage account + container)
+#   - RBAC permissions for the GitHub Actions service principal
+#   - OIDC Federated Identity Credentials in Microsoft Entra ID
+#     so GitHub Actions can authenticate to Azure without any
+#     stored secrets — for every branch and environment.
+#
+# WHEN TO RUN:
+#   - Manually on first-time project setup
+#   - When adding a new branch or GitHub Environment that needs
+#     Azure access (re-running is fully safe — idempotent)
+#   - If backend storage is accidentally deleted
+#
+# SAFE TO RUN REPEATEDLY: Every step is idempotent.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: "Azure region for backend resources"
+        required: false
+        default: "koreacentral"
+        type: string
+      github_repo:
+        description: "GitHub repo in org/repo format (e.g. Bhanuprakash842/reactapp)"
+        required: true
+        type: string
+      confirm:
+        description: "Type 'bootstrap' to confirm you want to run this"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC login to Azure
+
+jobs:
+  bootstrap:
+    name: Provision Foundation Infrastructure
+    runs-on: ubuntu-latest
+
+    # Safety gate: prevent accidental runs
+    if: github.event.inputs.confirm == 'bootstrap'
+
+    env:
+      RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+      STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      LOCATION: ${{ github.event.inputs.location }}
+      GITHUB_REPO: ${{ github.event.inputs.github_repo }}
+      APP_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ----------------------------------------------------------
+      # STEP 1: Resource Group
+      # ----------------------------------------------------------
+      - name: Provision Resource Group
+        run: |
+          echo "===== STEP 1: Resource Group ====="
+          if ! az group show --name "$RESOURCE_GROUP" &>/dev/null; then
+            echo "Creating resource group: $RESOURCE_GROUP in $LOCATION"
+            az group create \
+              --name "$RESOURCE_GROUP" \
+              --location "$LOCATION"
+            echo "Resource group created."
+          else
+            echo "Resource group '$RESOURCE_GROUP' already exists. Skipping."
+          fi
+
+      # ----------------------------------------------------------
+      # STEP 2: Storage Account
+      # Hardened: TLS 1.2+, HTTPS only, no public blob access
+      # ----------------------------------------------------------
+      - name: Provision Storage Account
+        run: |
+          echo "===== STEP 2: Storage Account ====="
+          if ! az storage account show \
+                --name "$STORAGE_ACCOUNT" \
+                --resource-group "$RESOURCE_GROUP" &>/dev/null; then
+            echo "Creating storage account: $STORAGE_ACCOUNT"
+            az storage account create \
+              --name "$STORAGE_ACCOUNT" \
+              --resource-group "$RESOURCE_GROUP" \
+              --location "$LOCATION" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --https-only true \
+              --allow-blob-public-access false \
+              --default-action Allow
+            echo "Storage account created."
+          else
+            echo "Storage account '$STORAGE_ACCOUNT' already exists. Skipping."
+          fi
+
+      # ----------------------------------------------------------
+      # STEP 3: Blob Container (Terraform state lives here)
+      # ----------------------------------------------------------
+      - name: Provision Blob Container
+        run: |
+          echo "===== STEP 3: Blob Container ====="
+          if ! az storage container show \
+                --name "$CONTAINER" \
+                --account-name "$STORAGE_ACCOUNT" \
+                --auth-mode login &>/dev/null; then
+            echo "Creating blob container: $CONTAINER"
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$STORAGE_ACCOUNT" \
+              --auth-mode login
+            echo "Blob container created."
+          else
+            echo "Blob container '$CONTAINER' already exists. Skipping."
+          fi
+
+      # ----------------------------------------------------------
+      # STEP 4: Enable Blob Versioning
+      # Protects against accidental state corruption / deletion
+      # ----------------------------------------------------------
+      - name: Enable Blob Versioning on Storage Account
+        run: |
+          echo "===== STEP 4: Blob Versioning ====="
+          az storage account blob-service-properties update \
+            --account-name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --enable-versioning true
+          echo "Blob versioning enabled."
+
+      # ----------------------------------------------------------
+      # STEP 5: RBAC — Grant GitHub Actions service principal
+      # "Storage Blob Data Contributor" on the storage account.
+      # Required for OIDC-based Terraform backend auth (no keys).
+      # ----------------------------------------------------------
+      - name: Assign Storage RBAC to Service Principal
+        run: |
+          echo "===== STEP 5: RBAC Assignment ====="
+
+          ACCOUNT_ID=$(az storage account show \
+            --name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query id --output tsv)
+
+          SP_OBJECT_ID=$(az ad sp show \
+            --id "${{ secrets.AZURE_CLIENT_ID }}" \
+            --query id --output tsv)
+
+          ROLE_EXISTS=$(az role assignment list \
+            --assignee "$SP_OBJECT_ID" \
+            --role "Storage Blob Data Contributor" \
+            --scope "$ACCOUNT_ID" \
+            --query "length(@)")
+
+          if [ "$ROLE_EXISTS" -eq "0" ]; then
+            echo "Assigning 'Storage Blob Data Contributor' to service principal"
+            az role assignment create \
+              --assignee "$SP_OBJECT_ID" \
+              --role "Storage Blob Data Contributor" \
+              --scope "$ACCOUNT_ID"
+            echo "RBAC assignment created."
+          else
+            echo "RBAC role already assigned. Skipping."
+          fi
+
+      # ----------------------------------------------------------
+      # STEP 6: OIDC Federated Identity Credentials
+      #
+      # This is what lets GitHub Actions authenticate to Azure
+      # using a short-lived OIDC token — no client secrets stored
+      # anywhere. Each "subject" maps to a specific GitHub context
+      # (branch, environment, or PR). Entra ID verifies the token
+      # subject matches one of these registered entries.
+      #
+      # Production pattern: Register ALL subjects upfront here so
+      # you never need to touch the Azure portal manually again.
+      # Safe to run repeatedly — existing credentials are skipped.
+      # ----------------------------------------------------------
+      - name: Provision OIDC Federated Identity Credentials
+        run: |
+          echo "===== STEP 6: OIDC Federated Credentials ====="
+
+          # Get the App Registration object ID from the client ID
+          APP_OBJECT_ID=$(az ad app show \
+            --id "$APP_CLIENT_ID" \
+            --query id --output tsv)
+
+          echo "App Registration Object ID: $APP_OBJECT_ID"
+
+          # Helper: idempotently create a federated credential.
+          # Checks by display_name — skips if already exists.
+          upsert_federated_credential() {
+            local DISPLAY_NAME="$1"
+            local SUBJECT="$2"
+            local DESCRIPTION="$3"
+
+            EXISTING=$(az ad app federated-credential list \
+              --id "$APP_OBJECT_ID" \
+              --query "[?name=='$DISPLAY_NAME'].name" \
+              --output tsv)
+
+            if [ -z "$EXISTING" ]; then
+              echo "  Creating: $DISPLAY_NAME"
+              echo "  Subject : $SUBJECT"
+              az ad app federated-credential create \
+                --id "$APP_OBJECT_ID" \
+                --parameters "{
+                  \"name\": \"$DISPLAY_NAME\",
+                  \"issuer\": \"https://token.actions.githubusercontent.com\",
+                  \"subject\": \"$SUBJECT\",
+                  \"description\": \"$DESCRIPTION\",
+                  \"audiences\": [\"api://AzureADTokenExchange\"]
+                }"
+              echo "  Created."
+            else
+              echo "  Exists (skipping): $DISPLAY_NAME"
+            fi
+            echo ""
+          }
+
+          # ---- main branch ----
+          # Triggered by: pushes to main (Terraform + CD pipelines)
+          upsert_federated_credential \
+            "github-branch-main" \
+            "repo:${GITHUB_REPO}:ref:refs/heads/main" \
+            "GitHub Actions — main branch"
+
+          # ---- dev branch ----
+          # Triggered by: pushes to dev (CI + Docker build/push)
+          upsert_federated_credential \
+            "github-branch-dev" \
+            "repo:${GITHUB_REPO}:ref:refs/heads/dev" \
+            "GitHub Actions — dev branch"
+
+          # ---- production environment ----
+          # Triggered by: jobs scoped to the 'production' GitHub Environment.
+          # GitHub Environments give you approval gates + env-specific secrets.
+          # Subject is stable — adding new branches doesn't require new credentials.
+          upsert_federated_credential \
+            "github-environment-production" \
+            "repo:${GITHUB_REPO}:environment:production" \
+            "GitHub Actions — production environment"
+
+          # ---- staging environment ----
+          upsert_federated_credential \
+            "github-environment-staging" \
+            "repo:${GITHUB_REPO}:environment:staging" \
+            "GitHub Actions — staging environment"
+
+          # ---- pull requests ----
+          # Required if any workflow runs on pull_request events and
+          # needs Azure access (e.g. terraform plan on a PR).
+          upsert_federated_credential \
+            "github-pull-request" \
+            "repo:${GITHUB_REPO}:pull_request" \
+            "GitHub Actions — pull requests"
+
+          echo "All federated credentials are configured."
+          echo ""
+          echo "Current credentials on the app registration:"
+          az ad app federated-credential list \
+            --id "$APP_OBJECT_ID" \
+            --query "[].{Name:name, Subject:subject}" \
+            --output table
+
+      # ----------------------------------------------------------
+      # Final: Print summary of what was provisioned
+      # ----------------------------------------------------------
+      - name: Bootstrap Summary
+        run: |
+          echo ""
+          echo "============================================"
+          echo "        BOOTSTRAP COMPLETE"
+          echo "============================================"
+          echo "Resource Group  : $RESOURCE_GROUP"
+          echo "Storage Account : $STORAGE_ACCOUNT"
+          echo "Container       : $CONTAINER"
+          echo "Location        : $LOCATION"
+          echo "GitHub Repo     : $GITHUB_REPO"
+          echo ""
+          echo "GitHub Actions Variables required:"
+          echo "  TFSTATE_RESOURCE_GROUP  = $RESOURCE_GROUP"
+          echo "  TFSTATE_STORAGE_ACCOUNT = $STORAGE_ACCOUNT"
+          echo "  TFSTATE_CONTAINER       = $CONTAINER"
+          echo ""
+          echo "OIDC subjects registered in Entra ID:"
+          echo "  repo:${GITHUB_REPO}:ref:refs/heads/main"
+          echo "  repo:${GITHUB_REPO}:ref:refs/heads/dev"
+          echo "  repo:${GITHUB_REPO}:environment:production"
+          echo "  repo:${GITHUB_REPO}:environment:staging"
+          echo "  repo:${GITHUB_REPO}:pull_request"
+          echo ""
+          echo "No manual Entra ID steps required."
+          echo "All pipelines can now authenticate to Azure."
+          echo "============================================"
+

@@ -1,0 +1,230 @@
+name: Pipeline 3 - Application CD (Build, Push, Deploy)
+
+# ============================================================
+# PURPOSE: Build the React app, build and push the Docker image
+# to Docker Hub, and deploy the updated container to the
+# Azure VM. This pipeline is fully independent of Terraform.
+#
+# WHEN TO RUN:
+#   - Push to main when application files change
+#   - Push to dev (build + push only, no deploy)
+#   - Manually via workflow_dispatch
+#
+# REQUIRES:
+#   - VM must already be provisioned (Pipeline 2 - Terraform)
+#   - Docker Hub credentials configured as GitHub secrets
+# ============================================================
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "src/**"
+      - "public/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Dockerfile"
+      - ".github/workflows/cd.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC login to Azure (deploy step)
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel an in-flight deployment
+
+jobs:
+
+  # ============================================================
+  # JOB 1: CI — Test and Build React Application
+  # Runs on both dev and main
+  # ============================================================
+
+  ci:
+    name: CI - Test and Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests
+        run: npm test -- --watchAll=false
+        env:
+          CI: true
+
+      - name: Build React Application
+        run: npm run build
+        env:
+          CI: true
+
+  # ============================================================
+  # JOB 2: Docker — Build and Push Image to Docker Hub
+  # Runs on both dev and main
+  # ============================================================
+
+  docker:
+    name: Docker - Build and Push
+    runs-on: ubuntu-latest
+    needs: ci
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      latest_tag: ${{ steps.meta.outputs.latest_tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Tag strategy:
+      #   dev  branch → dev-<sha7>   / dev-latest
+      #   main branch → main-<sha7> / latest
+      - name: Generate Docker Image Metadata
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/dev" ]]; then
+            TAG="dev-${GITHUB_SHA::7}"
+            LATEST_TAG="dev-latest"
+          else
+            TAG="main-${GITHUB_SHA::7}"
+            LATEST_TAG="latest"
+          fi
+
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${TAG}"
+
+          echo "image=$IMAGE"       >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "========== DOCKER IMAGE METADATA =========="
+          echo "Image      : $IMAGE"
+          echo "Latest tag : $LATEST_TAG"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ steps.meta.outputs.tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/reactapp:${{ steps.meta.outputs.latest_tag }}
+
+  # ============================================================
+  # JOB 3: Deploy — Roll out the new container on the Azure VM
+  # Runs only on main (dev pushes stop after Docker push)
+  # ============================================================
+
+  deploy:
+    name: Deploy - Azure Linux VM
+    runs-on: ubuntu-latest
+
+    needs:
+      - docker
+
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      IMAGE: ${{ needs.docker.outputs.image }}
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Uses Azure VM Run Command — no SSH private key needed.
+      # The script runs directly on the VM through the Azure control plane.
+      - name: Deploy Docker Container
+        run: |
+          echo "========== DEPLOYMENT STARTED =========="
+          echo "Docker Image: $IMAGE"
+
+          az vm run-command invoke \
+            --resource-group reactapp-infra-rg \
+            --name reactapp-vm \
+            --command-id RunShellScript \
+            --scripts "
+              set -e
+
+              echo 'Waiting for cloud-init to finish...'
+              cloud-init status --wait || true
+
+              echo 'Ensuring Docker is running...'
+              sudo systemctl enable --now docker
+
+              if ! command -v curl >/dev/null 2>&1; then
+                sudo apt-get update -qq
+                sudo apt-get install -y curl
+              fi
+
+              echo 'Pulling Docker image: $IMAGE'
+              sudo docker pull '$IMAGE'
+
+              echo 'Stopping previous container...'
+              sudo docker rm -f reactapp-prod || true
+
+              echo 'Starting new container...'
+              sudo docker run -d \
+                --name reactapp-prod \
+                --restart unless-stopped \
+                -p 80:80 \
+                '$IMAGE'
+
+              echo 'Health checking application...'
+              for attempt in \$(seq 1 12); do
+                if curl -fsS http://localhost/ >/dev/null; then
+                  echo 'Application is healthy!'
+                  exit 0
+                fi
+                echo \"Attempt \$attempt/12 — waiting 5s...\"
+                sleep 5
+              done
+
+              echo 'Health check failed. Container logs:'
+              sudo docker logs --tail 50 reactapp-prod
+              exit 1
+            "
+
+      - name: Show Deployment Details
+        run: |
+          PUBLIC_IP=$(az vm show \
+            --resource-group reactapp-infra-rg \
+            --name reactapp-vm \
+            --show-details \
+            --query publicIps \
+            --output tsv)
+
+          echo "========================================"
+          echo "         DEPLOYMENT SUCCESSFUL"
+          echo "========================================"
+          echo "Image    : $IMAGE"
+          echo "VM       : reactapp-vm"
+          echo "App URL  : http://$PUBLIC_IP"
+          echo "========================================"
+

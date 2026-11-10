@@ -1,0 +1,245 @@
+name: Pipeline 2 - Infrastructure (Terraform)
+
+# ============================================================
+# PURPOSE: Provision and manage Azure infrastructure using
+# Terraform. Assumes the backend storage account already exists
+# (provisioned by Pipeline 1 - Bootstrap).
+#
+# WHEN TO RUN:
+#   - Push to main when terraform/ files change
+#   - Manually via workflow_dispatch
+#
+# REQUIRES: Bootstrap pipeline must have run at least once.
+# ============================================================
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC login to Azure
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel an in-flight infra change
+
+jobs:
+  terraform:
+    name: Terraform - Provision Azure Infrastructure
+    runs-on: ubuntu-latest
+
+    env:
+      # Terraform Azure authentication via OIDC — no static credentials
+      ARM_USE_OIDC: true
+      ARM_USE_AZUREAD: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Terraform variable inputs
+      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_admin_source_cidr: ${{ vars.AZURE_ADMIN_SOURCE_CIDR }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      # ----------------------------------------------------------
+      # Pre-flight: Ensure the backend storage account, container,
+      # and RBAC exist before terraform init runs. Fully idempotent
+      # — skips each resource if it already exists. This means the
+      # terraform pipeline is self-healing: it recovers automatically
+      # if the storage account is accidentally deleted, without
+      # needing to run the bootstrap pipeline again.
+      #
+      # NOTE: This cannot create the OIDC federated credential
+      # (that must be done in bootstrap once). But since OIDC
+      # authentication succeeds before this step runs, the credential
+      # already exists by definition whenever this step executes.
+      # ----------------------------------------------------------
+      - name: Ensure Terraform Backend Exists
+        run: |
+          RESOURCE_GROUP="${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          STORAGE_ACCOUNT="${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          CONTAINER="${{ vars.TFSTATE_CONTAINER }}"
+          LOCATION="koreacentral"
+
+          echo "===== Pre-flight: Terraform Backend Check ====="
+
+          if ! az group show --name "$RESOURCE_GROUP" &>/dev/null; then
+            echo "Creating resource group: $RESOURCE_GROUP"
+            az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+          else
+            echo "✓ Resource group exists: $RESOURCE_GROUP"
+          fi
+
+          if ! az storage account show \
+                --name "$STORAGE_ACCOUNT" \
+                --resource-group "$RESOURCE_GROUP" &>/dev/null; then
+            echo "Creating storage account: $STORAGE_ACCOUNT"
+            az storage account create \
+              --name "$STORAGE_ACCOUNT" \
+              --resource-group "$RESOURCE_GROUP" \
+              --location "$LOCATION" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --https-only true \
+              --allow-blob-public-access false
+            az storage account blob-service-properties update \
+              --account-name "$STORAGE_ACCOUNT" \
+              --resource-group "$RESOURCE_GROUP" \
+              --enable-versioning true
+          else
+            echo "✓ Storage account exists: $STORAGE_ACCOUNT"
+          fi
+
+          if ! az storage container show \
+                --name "$CONTAINER" \
+                --account-name "$STORAGE_ACCOUNT" \
+                --auth-mode login &>/dev/null; then
+            echo "Creating blob container: $CONTAINER"
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$STORAGE_ACCOUNT" \
+              --auth-mode login
+          else
+            echo "✓ Blob container exists: $CONTAINER"
+          fi
+
+          ACCOUNT_ID=$(az storage account show \
+            --name "$STORAGE_ACCOUNT" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query id --output tsv)
+
+          SP_OBJECT_ID=$(az ad sp show \
+            --id "${{ secrets.AZURE_CLIENT_ID }}" \
+            --query id --output tsv)
+
+          ROLE_EXISTS=$(az role assignment list \
+            --assignee "$SP_OBJECT_ID" \
+            --role "Storage Blob Data Contributor" \
+            --scope "$ACCOUNT_ID" \
+            --query "length(@)")
+
+          if [ "$ROLE_EXISTS" -eq "0" ]; then
+            echo "Assigning Storage Blob Data Contributor to service principal"
+            az role assignment create \
+              --assignee "$SP_OBJECT_ID" \
+              --role "Storage Blob Data Contributor" \
+              --scope "$ACCOUNT_ID"
+          else
+            echo "✓ RBAC already assigned"
+          fi
+
+          echo "===== Backend is ready ====="
+
+      # ----------------------------------------------------------
+      # Init: Connect Terraform to the remote state backend.
+      # Backend values come from GitHub Actions variables — no
+      # credentials or account names are hardcoded in source.
+      # ----------------------------------------------------------
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=reactapp-prod.tfstate" \
+            -backend-config="use_azuread_auth=true"
+
+      # ----------------------------------------------------------
+      # Format check: Fail fast on badly formatted .tf files.
+      # ----------------------------------------------------------
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      # ----------------------------------------------------------
+      # Validate: Catch syntax / reference errors before planning.
+      # ----------------------------------------------------------
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      # ----------------------------------------------------------
+      # Plan: Generate and display the execution plan.
+      # Saved to tfplan so apply uses the exact same plan.
+      # ----------------------------------------------------------
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan -out=tfplan
+          terraform show -no-color tfplan
+
+      # ----------------------------------------------------------
+      # Safety gate: Fail the pipeline if the plan contains any
+      # resource deletions or replacements. Forces a manual review
+      # before destructive infrastructure changes are applied.
+      # ----------------------------------------------------------
+      - name: Terraform Destructive Change Check
+        working-directory: terraform
+        run: |
+          if terraform show -json tfplan | jq -e \
+            '[.resource_changes[]?.change.actions[]?] | any(. == "delete")' \
+            > /dev/null; then
+            echo "::error::Terraform plan contains a deletion or replacement."
+            echo "Review the plan output above before allowing this deployment."
+            exit 1
+          fi
+          echo "Safety check passed: no resource deletions or replacements detected."
+
+      # ----------------------------------------------------------
+      # Apply: Execute the exact plan generated above.
+      # ----------------------------------------------------------
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      # ----------------------------------------------------------
+      # State summary: Show what Terraform manages after apply.
+      # ----------------------------------------------------------
+      - name: Show Terraform State Summary
+        working-directory: terraform
+        run: |
+          echo "========== TERRAFORM RESOURCE LIST =========="
+          terraform state list
+
+          echo ""
+          echo "========== AZURE VM DETAILS =========="
+          terraform state show azurerm_linux_virtual_machine.vm
+
+      # ----------------------------------------------------------
+      # Azure confirmation: Show live VM status from Azure.
+      # ----------------------------------------------------------
+      - name: Show Azure VM Details
+        run: |
+          echo "========== LIVE AZURE VM STATUS =========="
+          az vm show \
+            --resource-group reactapp-infra-rg \
+            --name reactapp-vm \
+            --show-details \
+            --query "{VMName:name, Location:location, PublicIP:publicIps, PowerState:powerState}" \
+            --output table
+
