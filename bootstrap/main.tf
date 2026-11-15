@@ -22,7 +22,9 @@ terraform {
 
 provider "azurerm" {
   features {}
-  subscription_id = var.subscription_id
+
+  subscription_id     = var.subscription_id
+  storage_use_azuread = true
 }
 
 # Uses your existing Azure CLI login.
@@ -55,6 +57,7 @@ resource "azurerm_storage_account" "state" {
   min_tls_version                 = "TLS1_2"
   https_traffic_only_enabled      = true
   allow_nested_items_to_be_public = false
+  shared_access_key_enabled = false
 
   blob_properties {
     versioning_enabled = true
