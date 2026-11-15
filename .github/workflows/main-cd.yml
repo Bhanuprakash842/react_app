@@ -236,7 +236,7 @@ jobs:
       # Deploy using Azure VM Run Command - no SSH private key needed
       - name: Deploy Docker Container
         env:
-          IMAGE: ${{ needs.docker.outputs.image }}
+          IMAGE: ${{secrets.DOCKERHUB_USERNAME}}/reactapp:latest
         run: |
           echo "========== DEPLOYMENT STARTED =========="
           echo "Docker Image: $IMAGE"
